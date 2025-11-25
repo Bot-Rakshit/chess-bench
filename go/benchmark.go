@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"os/exec"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -41,57 +42,80 @@ func NewStockfishEngine(threads, depth int) (*StockfishEngine, error) {
 	if err := cmd.Start(); err != nil {
 		return nil, err
 	}
-	e := &StockfishEngine{cmd: cmd, stdin: stdin, reader: bufio.NewReader(stdout), depth: depth}
+	// Use smaller buffer for lower latency (256 bytes like optimized Rust)
+	e := &StockfishEngine{
+		cmd:    cmd,
+		stdin:  stdin,
+		reader: bufio.NewReaderSize(stdout, 256),
+		depth:  depth,
+	}
 	e.send("uci")
-	e.waitFor("uciok")
+	e.waitForReady("uciok")
 	e.send(fmt.Sprintf("setoption name Threads value %d", threads))
 	e.send("setoption name UCI_ShowWDL value true")
 	e.send("isready")
-	e.waitFor("readyok")
+	e.waitForReady("readyok")
 	return e, nil
 }
 
-func (e *StockfishEngine) send(cmd string) { e.stdin.Write([]byte(cmd + "\n")) }
+func (e *StockfishEngine) send(cmd string) {
+	io.WriteString(e.stdin, cmd+"\n")
+}
 
-func (e *StockfishEngine) waitFor(token string) []string {
-	var lines []string
+// waitForReady waits for a token without parsing WDL
+func (e *StockfishEngine) waitForReady(token string) {
+	for {
+		line, err := e.reader.ReadString('\n')
+		if err != nil || strings.Contains(line, token) {
+			return
+		}
+	}
+}
+
+// analyze sends position and returns WDL, parsing inline without storing lines
+func (e *StockfishEngine) analyze(fen string) (int, int, int) {
+	e.send("position fen " + fen)
+	e.send(fmt.Sprintf("go depth %d", e.depth))
+
+	w, d, l := 333, 334, 333
+
 	for {
 		line, err := e.reader.ReadString('\n')
 		if err != nil {
 			break
 		}
-		line = strings.TrimSpace(line)
-		lines = append(lines, line)
-		if strings.Contains(line, token) {
-			return lines
-		}
-	}
-	return lines
-}
 
-func (e *StockfishEngine) analyze(fen string) (int, int, int) {
-	e.send(fmt.Sprintf("position fen %s", fen))
-	e.send(fmt.Sprintf("go depth %d", e.depth))
-	lines := e.waitFor("bestmove")
-	w, d, l := 333, 334, 333
-	for i := len(lines) - 1; i >= 0; i-- {
-		if strings.Contains(lines[i], "wdl") {
-			parts := strings.Fields(lines[i])
-			for j, p := range parts {
-				if p == "wdl" && j+3 < len(parts) {
-					fmt.Sscanf(parts[j+1], "%d", &w)
-					fmt.Sscanf(parts[j+2], "%d", &d)
-					fmt.Sscanf(parts[j+3], "%d", &l)
-					break
+		// Parse WDL inline - look for " wdl " pattern
+		if idx := strings.Index(line, " wdl "); idx != -1 {
+			// Extract the part after "wdl "
+			rest := line[idx+5:]
+			parts := strings.SplitN(rest, " ", 4)
+			if len(parts) >= 3 {
+				if v, err := strconv.Atoi(parts[0]); err == nil {
+					w = v
+				}
+				if v, err := strconv.Atoi(parts[1]); err == nil {
+					d = v
+				}
+				if v, err := strconv.Atoi(parts[2]); err == nil {
+					l = v
 				}
 			}
+		}
+
+		// Check for bestmove to exit
+		if strings.HasPrefix(line, "bestmove") {
 			break
 		}
 	}
+
 	return w, d, l
 }
 
-func (e *StockfishEngine) quit() { e.send("quit"); e.cmd.Wait() }
+func (e *StockfishEngine) quit() {
+	e.send("quit")
+	e.cmd.Wait()
+}
 
 func wdlToProb(w, d, l int, isWhite bool) float64 {
 	if !isWhite {
@@ -111,11 +135,12 @@ func calcAccuracy(before, after float64) float64 {
 	return acc
 }
 
+var httpClient = &http.Client{Timeout: 60 * time.Second}
+
 func fetchArchives(username string) ([]string, error) {
-	client := &http.Client{Timeout: 30 * time.Second}
-	req, _ := http.NewRequest("GET", fmt.Sprintf("https://api.chess.com/pub/player/%s/games/archives", username), nil)
+	req, _ := http.NewRequest("GET", "https://api.chess.com/pub/player/"+username+"/games/archives", nil)
 	req.Header.Set("User-Agent", "ChessBenchmark/1.0")
-	resp, err := client.Do(req)
+	resp, err := httpClient.Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -126,10 +151,9 @@ func fetchArchives(username string) ([]string, error) {
 }
 
 func fetchGames(url string) ([]GameData, error) {
-	client := &http.Client{Timeout: 60 * time.Second}
 	req, _ := http.NewRequest("GET", url, nil)
 	req.Header.Set("User-Agent", "ChessBenchmark/1.0")
-	resp, err := client.Do(req)
+	resp, err := httpClient.Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -143,6 +167,7 @@ func analyzeGame(g GameData, username string, sfThreads, depth int) (float64, fl
 	if g.PGN == "" {
 		return 0, 0, 0, "", "", false
 	}
+
 	white, black := "", ""
 	if g.White != nil {
 		white = strings.ToLower(g.White.Username)
@@ -155,6 +180,7 @@ func analyzeGame(g GameData, username string, sfThreads, depth int) (float64, fl
 		return 0, 0, 0, "", "", false
 	}
 
+	// Parse PGN using notnil/chess (this is the slow part we can't optimize without changing library)
 	pgnGame, err := chess.PGN(strings.NewReader(g.PGN))
 	if err != nil {
 		return 0, 0, 0, "", "", false
@@ -162,21 +188,30 @@ func analyzeGame(g GameData, username string, sfThreads, depth int) (float64, fl
 	game := chess.NewGame(pgnGame)
 	moves := game.Moves()
 
+	if len(moves) == 0 {
+		return 0, 0, 0, "", "", false
+	}
+
 	engine, err := NewStockfishEngine(sfThreads, depth)
 	if err != nil {
 		return 0, 0, 0, "", "", false
 	}
 	defer engine.quit()
 
+	// Pre-allocate slices
+	whiteAcc := make([]float64, 0, len(moves)/2+1)
+	blackAcc := make([]float64, 0, len(moves)/2+1)
+
 	pos := chess.NewGame()
-	var whiteAcc, blackAcc []float64
 	pw, pd, pl := engine.analyze(pos.Position().String())
 
 	for _, mv := range moves {
 		isWhite := pos.Position().Turn() == chess.White
 		pos.Move(mv)
+
 		cw, cd, cl := engine.analyze(pos.Position().String())
 		acc := calcAccuracy(wdlToProb(pw, pd, pl, isWhite), wdlToProb(cw, cd, cl, isWhite))
+
 		if isWhite {
 			whiteAcc = append(whiteAcc, acc)
 		} else {
@@ -198,6 +233,7 @@ func analyzeGame(g GameData, username string, sfThreads, depth int) (float64, fl
 		}
 		ba /= float64(len(blackAcc))
 	}
+
 	return wa, ba, len(whiteAcc) + len(blackAcc), white, black, true
 }
 
@@ -270,8 +306,10 @@ func main() {
 			defer wg.Done()
 			sem <- struct{}{}
 			defer func() { <-sem }()
+
 			wa, ba, m, w, b, ok := analyzeGame(game, *username, *sfThreads, *depth)
 			results <- result{wa, ba, m, w, b, ok}
+
 			c := atomic.AddInt64(&completed, 1)
 			if c%10 == 0 || c == int64(total) {
 				fmt.Printf("  Analyzed %d/%d games (%.2f games/sec)\n", c, total, float64(c)/time.Since(analysisStart).Seconds())

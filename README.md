@@ -31,7 +31,7 @@ Fetches games from [Chess.com](https://chess.com) public API and analyzes them u
 | 🥇 | **Rust** | shakmaty | **18.73** | **1,643** | **51.5s** |
 | 🥈 | Python | python-chess | 18.67 | 1,624 | 53.6s |
 | 🥉 | Node.js | chess.js | 17.73 | 1,503 | 56.4s |
-| 4 | Go | notnil/chess | 13.84 | 1,206 | 70.7s |
+| 4 | Go | notnil/chess | 14.65 | 1,279 | 66.8s |
 
 ### Pure PGN Parsing (1000 games, no Stockfish)
 
