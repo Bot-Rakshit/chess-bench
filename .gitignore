@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Node.js
+node/node_modules/
+node/package-lock.json
+
+# Rust
+rust/target/
+rust/Cargo.lock
+
+# Go
+go/benchmark
+go/pgn_benchmark
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# OS
+.DS_Store

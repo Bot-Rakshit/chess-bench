@@ -1,0 +1,12 @@
+{
+  "name": "chess-bench-node",
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "benchmark": "node benchmark.js",
+    "pgn": "node pgn_benchmark.js"
+  },
+  "dependencies": {
+    "chess.js": "^1.0.0-beta.8"
+  }
+}
